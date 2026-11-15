@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>متابعة أوامر الإنتاج</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--tx:#1c2430;--mu:#6b7686;--bd:#e1e5eb;--pr:#1d6b4f;--rd:#c62828;--am:#b26a00;--gn:#2e7d32}
+@media(prefers-color-scheme:dark){:root{--bg:#14181d;--card:#1d232b;--tx:#e8ecf1;--mu:#93a0b0;--bd:#2c3540;--pr:#4cb38a;--rd:#ef6a6a;--am:#e0a040;--gn:#6fcf76}}
+*{box-sizing:border-box}body{margin:0;font-family:Tahoma,Arial,sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
+nav{display:flex;gap:6px;flex-wrap:wrap;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:5}
+nav button{border:0;background:none;padding:8px 14px;border-radius:8px;color:var(--mu);cursor:pointer;font:inherit}
+nav button.on{background:var(--pr);color:#fff}nav .sp{flex:1}
+main{padding:16px;max-width:1200px;margin:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px}
+.kpi b{display:block;font-size:26px}.kpi span{color:var(--mu)}
+.box{overflow-x:auto;background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-bottom:16px}
+table{border-collapse:collapse;width:100%}th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--bd);white-space:nowrap}
+th{color:var(--mu);font-weight:600;background:var(--bg)}
+button.b,select,input{font:inherit;padding:6px 10px;border:1px solid var(--bd);border-radius:7px;background:var(--card);color:var(--tx)}
+button.b{cursor:pointer}button.p{background:var(--pr);color:#fff;border-color:var(--pr)}button.d{color:var(--rd)}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
+.t-overdue{color:var(--rd);font-weight:700}.t-due_today{color:var(--am);font-weight:700}.t-on_time{color:var(--gn)}.t-late{color:var(--am)}
+.tag{padding:2px 8px;border-radius:99px;border:1px solid var(--bd);font-size:12px}
+#modal{position:fixed;inset:0;background:#0008;display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:20px;z-index:9}
+#modal .card{width:min(900px,100%)}form.f{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+form.f label{display:flex;flex-direction:column;gap:4px;color:var(--mu)}
+</style></head><body>
+<div id="root"></div><div id="modal"><div class="card" id="mbody"></div></div>
+<script>
+const sb = supabase.createClient(CFG.url, CFG.key);
+const $ = s => document.querySelector(s);
+const ST = {'Opened':'مفتوح','Start':'تم بدء العمل','In progress':'جار العمل','Final review':'مراجعة نهائية وإغلاق فني','Done':'مغلق نهائياً'};
+const STATE = {overdue:'متأخرة',due_today:'مستحقة اليوم',on_time:'في موعدها',late:'نُفذت متأخرة',upcoming:'قادمة'};
+const TASK = {Confirmation:'تأكيد إنتاجية',Inspection:'تسجيل فحوصات'};
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const today = () => new Date().toLocaleDateString('en-CA', {timeZone:'Asia/Riyadh'});
+const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0,10); };
+const opts = (o, sel) => Object.entries(o).map(([k,v]) => `<option value="${esc(k)}" ${k===sel?'selected':''}>${v}</option>`).join('');
+let tab = 'dash';
+
+async function boot() { const {data:{session}} = await sb.auth.getSession(); session ? app() : login(); }
+function login() {
+  $('#root').innerHTML = `<main style="max-width:380px"><form id="lf" class="card f" style="grid-template-columns:1fr"><h2>تسجيل الدخول</h2>
+  <label>البريد<input id="em" type="email" required></label><label>كلمة المرور<input id="pw" type="password" required></label>
+  <button class="b p">دخول</button></form></main>`;
+  $('#lf').onsubmit = async e => { e.preventDefault();
+    const {error} = await sb.auth.signInWithPassword({email:$('#em').value, password:$('#pw').value});
+    error ? alert(error.message) : app(); };
+}
+function app() {
+  const tabs = {dash:'لوحة المتابعة', tasks:'المهام المطلوبة', orders:'أوامر الإنتاج', new:'+ أمر جديد'};
+  $('#root').innerHTML = `<nav>${Object.entries(tabs).map(([k,v]) => `<button class="${k===tab?'on':''}" onclick="tab='${k}';app()">${v}</button>`).join('')}
+  <span class="sp"></span><button onclick="sb.auth.signOut().then(login)">خروج</button></nav><main id="view">جاري التحميل…</main>`;
+  ({dash, tasks, orders, new: newOrder})[tab]();
+}
+async function fetchAll(q) { // يتجاوز حد 1000 صف
+  let all = [], from = 0;
+  for (;;) { const {data, error} = await q().range(from, from + 999); if (error) throw error;
+    all = all.concat(data); if (data.length < 1000) return all; from += 1000; }
+}
+
+async function dash() {
+  const rows = await fetchAll(() => sb.from('v_order_summary').select('*'));
+  const by = s => rows.filter(r => r.status === s).length, open = rows.filter(r => r.status !== 'Done');
+  const sum = k => open.reduce((a,r) => a + r[k], 0), ot = rows.reduce((a,r) => a + r.tasks_on_time, 0), lt = rows.reduce((a,r) => a + r.tasks_late, 0);
+  const late = open.filter(r => r.tasks_overdue > 0 || r.tasks_due_today > 0).sort((a,b) => b.max_delay - a.max_delay);
+  $('#view').innerHTML = `<div class="grid">${Object.entries(ST).map(([k,v]) => `<div class="card kpi"><b>${by(k)}</b><span>${v}</span></div>`).join('')}</div>
+  <div class="grid"><div class="card kpi"><b class="t-overdue">${sum('tasks_overdue')}</b><span>مهام متأخرة (أوامر غير مغلقة)</span></div>
+  <div class="card kpi"><b class="t-due_today">${sum('tasks_due_today')}</b><span>مهام مستحقة اليوم</span></div>
+  <div class="card kpi"><b>${late.length}</b><span>أوامر تحتاج تنفيذ مهام</span></div>
+  <div class="card kpi"><b>${ot+lt ? Math.round(100*ot/(ot+lt)) : 0}%</b><span>نسبة التنفيذ في الموعد</span></div></div>
+  <h3>الأوامر الأكثر تأخراً</h3>${ordersTable(late.slice(0,20))}`;
+}
+
+function ordersTable(rows) {
+  return `<div class="box"><table><tr><th>الأمر</th><th>المزرعة</th><th>العنبر</th><th>البدء</th><th>الانتهاء</th><th>الحالة</th><th>الإنجاز</th><th>متأخرة</th><th>اليوم</th><th>أقصى تأخير</th><th></th></tr>
+  ${rows.map(r => `<tr><td>${r.order_no}</td><td>${esc(r.farm)}</td><td>${esc(r.house)}</td><td>${r.start_date}</td><td>${r.end_date}</td>
+  <td><span class="tag">${ST[r.status]}</span></td><td>${r.tasks_total ? Math.round(100*r.tasks_done/r.tasks_total) : 0}%</td>
+  <td class="${r.tasks_overdue?'t-overdue':''}">${r.tasks_overdue}</td><td class="${r.tasks_due_today?'t-due_today':''}">${r.tasks_due_today}</td>
+  <td>${r.max_delay} يوم</td><td><button class="b" onclick="openOrder(${r.order_no})">فتح</button></td></tr>`).join('') || '<tr><td colspan="11">لا توجد بيانات</td></tr>'}</table></div>`;
+}
+
+async function orders() {
+  const rows = await fetchAll(() => sb.from('v_order_summary').select('*').order('start_date', {ascending:false}));
+  window._ord = rows; const farms = [...new Set(rows.map(r => r.farm))].sort();
+  $('#view').innerHTML = `<div class="bar"><input id="q" placeholder="بحث برقم الأمر أو العنبر">
+  <select id="fs"><option value="">كل الحالات</option>${opts(ST)}</select>
+  <select id="ff"><option value="">كل المزارع</option>${farms.map(f => `<option>${esc(f)}</option>`).join('')}</select><span id="cnt"></span></div><div id="ot"></div>`;
+  const draw = () => { const q = $('#q').value.trim(), s = $('#fs').value, f = $('#ff').value;
+    const r = rows.filter(x => (!s || x.status === s) && (!f || x.farm === f) && (!q || String(x.order_no).includes(q) || (x.house||'').includes(q)));
+    $('#cnt').textContent = r.length + ' أمر'; $('#ot').innerHTML = ordersTable(r.slice(0, 300)); };
+  ['q','fs','ff'].forEach(i => $('#'+i).oninput = draw); draw();
+}
+
+async function tasks() {
+  const rows = await fetchAll(() => sb.from('v_tasks').select('*').in('state', ['overdue','due_today']).neq('order_status','Done').order('delay_days', {ascending:false}));
+  const farms = [...new Set(rows.map(r => r.farm))].sort();
+  $('#view').innerHTML = `<div class="bar"><select id="tf"><option value="">كل المهام</option>${opts(TASK)}</select>
+  <select id="ts"><option value="">متأخرة + اليوم</option>${opts({overdue:'متأخرة فقط', due_today:'اليوم فقط'})}</select>
+  <select id="tm"><option value="">كل المزارع</option>${farms.map(f => `<option>${esc(f)}</option>`).join('')}</select><span id="cnt"></span></div><div id="tt"></div>`;
+  const draw = () => { const a = $('#tf').value, b = $('#ts').value, c = $('#tm').value;
+    const r = rows.filter(x => (!a || x.task === a) && (!b || x.state === b) && (!c || x.farm === c));
+    $('#cnt').textContent = r.length + ' مهمة'; $('#tt').innerHTML = `<div class="box"><table><tr><th>الأمر</th><th>المزرعة</th><th>العنبر</th><th>اليوم</th><th>الاستحقاق</th><th>المهمة</th><th>الحالة</th><th>التأخير</th><th></th></tr>
+    ${r.slice(0,500).map(x => `<tr><td><a href="#" onclick="openOrder(${x.order_no});return false">${x.order_no}</a></td><td>${esc(x.farm)}</td><td>${esc(x.house)}</td><td>${x.day_no}</td><td>${x.op_date}</td>
+    <td>${TASK[x.task]}</td><td class="t-${x.state}">${STATE[x.state]}</td><td>${x.delay_days} يوم</td>
+    <td><button class="b p" onclick="markDone(${x.op_id},'${x.task==='Confirmation'?'confirmation_at':'inspection_at'}',true,tasks)">تم التنفيذ</button></td></tr>`).join('') || '<tr><td colspan="9">لا توجد مهام معلقة 🎉</td></tr>'}</table></div>`; };
+  ['tf','ts','tm'].forEach(i => $('#'+i).oninput = draw); draw();
+}
+async function markDone(id, col, on, after) {
+  const {error} = await sb.from('operations').update({[col]: on ? today() : null}).eq('id', id);
+  if (error) return alert(error.message); after();
+}
+
+function newOrder() {
+  $('#view').innerHTML = `<form class="card f" id="nf"><label>رقم أمر الإنتاج<input name="order_no" type="number" required></label>
+  <label>المزرعة<input name="farm" required></label><label>كود المزرعة<input name="farm_code"></label><label>العنبر<input name="house" required></label>
+  <label>تاريخ البدء<input name="start_date" type="date" value="${today()}" required></label><label>الكمية المسكّنة<input name="housed_qty" type="number" required></label>
+  <button class="b p" style="align-self:end">إنشاء الأمر (29 يوماً تلقائياً)</button></form>`;
+  $('#nf').onsubmit = async e => { e.preventDefault(); const f = Object.fromEntries(new FormData(e.target)); f.housed_qty = +f.housed_qty;
+    f.target_qty = Math.round(f.housed_qty*0.95); f.mortality = Math.round(f.housed_qty*0.06);
+    const {error} = await sb.from('production_orders').insert(f); if (error) return alert(error.message);
+    openOrder(+f.order_no); };
+}
+
+async function openOrder(no) {
+  const [{data:o}, {data:ops}] = await Promise.all([sb.from('production_orders').select('*').eq('order_no', no).single(), sb.from('operations').select('*').eq('order_no', no).order('day_no')]);
+  const cell = (r, c) => r[c] ? `<span class="${r[c] <= r.op_date ? 't-on_time' : 't-late'}">✔ ${r[c]}</span> <button class="b d" onclick="mDone(${r.id},'${c}',false,${no})">إلغاء</button>`
+    : `<span class="${r.op_date < today() ? 't-overdue' : ''}">${r.op_date < today() ? 'متأخر ' + Math.round((new Date(today()) - new Date(r.op_date))/864e5) + ' يوم' : '—'}</span> <button class="b p" onclick="mDone(${r.id},'${c}',true,${no})">تم</button>`;
+  $('#mbody').innerHTML = `<div class="bar"><h3 style="margin:0;flex:1">أمر ${o.order_no} — ${esc(o.farm)} / عنبر ${esc(o.house)}</h3>
+  <select onchange="setStatus(${no},this.value)">${opts(ST, o.status)}</select><button class="b" onclick="$('#modal').style.display='none';app()">إغلاق</button></div>
+  <p>البدء ${o.start_date} · الانتهاء ${o.end_date} · الكمية ${o.housed_qty}</p>
+  <div class="box"><table><tr><th>اليوم</th><th>التاريخ</th><th>تأكيد الإنتاجية</th><th>تسجيل الفحوصات</th><th></th></tr>
+  ${ops.map(r => `<tr><td>${r.day_no}</td><td>${r.op_date}</td><td>${cell(r,'confirmation_at')}</td><td>${cell(r,'inspection_at')}</td>
+  <td><button class="b d" onclick="delDay(${r.id},${no})">حذف اليوم</button></td></tr>`).join('')}</table></div>
+  <button class="b" onclick="addDay(${no},'${o.start_date}',${ops.length ? ops[ops.length-1].day_no : 0})">+ إضافة يوم</button>`;
+  $('#modal').style.display = 'flex';
+}
+async function mDone(id, c, on, no) { await markDone(id, c, on, () => openOrder(no)); }
+async function setStatus(no, s) { const p = {status:s}; if (s === 'Done') p.actual_finish_date = today();
+  const {error} = await sb.from('production_orders').update(p).eq('order_no', no); if (error) alert(error.message); }
+async function delDay(id, no) { if (!confirm('حذف هذا اليوم ومهمتيه؟')) return;
+  const {error} = await sb.from('operations').delete().eq('id', id); error ? alert(error.message) : openOrder(no); }
+async function addDay(no, start, last) { const d = last + 1;
+  const {error} = await sb.from('operations').insert({order_no:no, day_no:d, op_date:addDays(start, d)}); error ? alert(error.message) : openOrder(no); }
+boot();
+</script></body></html>
